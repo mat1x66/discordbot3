@@ -38,7 +38,12 @@ if os.path.exists("cookies.txt"):
 def _search_sync(query: str):
     """Возвращает список треков [{'title', 'page'}]. Ссылка на сам поток берётся позже, при воспроизведении."""
     is_url = query.startswith(("http://", "https://"))
-    targets = [query] if is_url else [f"ytsearch1:{query}", f"scsearch1:{query}"]  # YouTube, потом SoundCloud
+    if is_url:
+        targets = [query]
+    elif SEARCH_PREFIX.startswith("sc"):  # SEARCH_PREFIX=scsearch1 -> сначала SoundCloud
+        targets = [f"scsearch1:{query}", f"ytsearch1:{query}"]
+    else:
+        targets = [f"ytsearch1:{query}", f"scsearch1:{query}"]
 
     for target in targets:
         try:
@@ -96,6 +101,11 @@ async def fetch_yandex_tracks(url: str) -> list[dict]:
 
         async def get(api_path: str):
             async with session.get(YA_API + api_path) as r:
+                if r.status == 451:
+                    raise RuntimeError(
+                        "Яндекс не отдаёт данные на IP этого сервера (региональное ограничение). "
+                        "Используй команду !list со списком треков (см. инструкцию)"
+                    )
                 if r.status in (401, 403) and not YANDEX_TOKEN:
                     raise RuntimeError(
                         f"Яндекс требует авторизацию ({r.status}). Нужен токен YANDEX_TOKEN "
@@ -169,10 +179,27 @@ def _download_sync(page_url: str) -> str:
     return path
 
 
+_NOISE_RE = re.compile(
+    r"\[[^\]]*\]|\([^)]*(?:official|video|audio|lyric|clip|hd|remaster)[^)]*\)", re.I
+)
+
+
+def _download_with_fallback(page_url: str, title: str) -> str:
+    """Сначала как есть (обычно YouTube); если YouTube не пускает сервер — ищем тот же трек на SoundCloud."""
+    try:
+        return _download_sync(page_url)
+    except Exception as e:
+        if page_url.startswith("scsearch"):
+            raise
+        print(f"[download] {str(e)[:120]} -> пробую SoundCloud")
+        query = _NOISE_RE.sub("", title).strip(" -") or title
+        return _download_sync(f"scsearch1:{query}")
+
+
 def start_prefetch(track: dict):
     """Запускает скачивание трека в фоне (если ещё не запущено)."""
     if "task" not in track:
-        task = asyncio.create_task(asyncio.to_thread(_download_sync, track["page"]))
+        task = asyncio.create_task(asyncio.to_thread(_download_with_fallback, track["page"], track["title"]))
         task.add_done_callback(lambda t: t.cancelled() or t.exception())  # без «Task exception never retrieved»
         track["task"] = task
 
@@ -285,16 +312,23 @@ async def on_ready():
     print(f"Бот запущен как {bot.user} (серверов: {len(bot.guilds)})")
 
 
-@bot.command(aliases=["p"])
-async def play(ctx, *, query: str):
-    """!play название или ссылка (YouTube, SoundCloud и др., плейлисты тоже)"""
+async def ensure_voice(ctx) -> bool:
+    """Заходит в голосовой канал автора команды. False, если автор не в канале."""
     if not ctx.author.voice or not ctx.author.voice.channel:
-        return await ctx.send("❌ Зайди в голосовой канал!")
-
+        await ctx.send("❌ Зайди в голосовой канал!")
+        return False
     if ctx.voice_client is None:
         await ctx.author.voice.channel.connect()
     elif ctx.voice_client.channel != ctx.author.voice.channel:
         await ctx.voice_client.move_to(ctx.author.voice.channel)
+    return True
+
+
+@bot.command(aliases=["p"])
+async def play(ctx, *, query: str):
+    """!play название или ссылка (YouTube, SoundCloud и др., плейлисты тоже)"""
+    if not await ensure_voice(ctx):
+        return
 
     query = query.strip()
     if YANDEX_URL_RE.match(query):
@@ -320,6 +354,35 @@ async def play(ctx, *, query: str):
     else:
         await ctx.send(f"✅ Добавлено треков: **{len(tracks)}**")
 
+    await play_next(ctx.guild, ctx.channel)
+
+
+@bot.command(name="list", aliases=["pl"])
+async def list_cmd(ctx, *, text: str = ""):
+    """!list + треки по одному на строку («Исполнитель - Название») или прикреплённый .txt файл"""
+    if ctx.message.attachments:
+        att = ctx.message.attachments[0]
+        if att.size > 300_000:
+            return await ctx.send("❌ Файл слишком большой (максимум ~300 КБ)")
+        text = (await att.read()).decode("utf-8-sig", errors="ignore")
+
+    lines = []
+    for raw in text.splitlines():
+        line = re.sub(r"^\s*\d+[.)]\s*", "", raw).strip()  # убираем нумерацию «1. »
+        if line:
+            lines.append(line)
+    lines = lines[:YANDEX_MAX_TRACKS]
+    if not lines:
+        return await ctx.send(
+            "❌ Пришли список: `!list` и далее треки по одному на строку, либо прикрепи файл .txt"
+        )
+
+    if not await ensure_voice(ctx):
+        return
+    state = get_state(ctx.guild.id)
+    state.queue.extend({"title": ln, "page": f"{SEARCH_PREFIX}:{ln}"} for ln in lines)
+    prefetch_next(state)
+    await ctx.send(f"✅ Добавлено треков: **{len(lines)}**")
     await play_next(ctx.guild, ctx.channel)
 
 
